@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git
+.env
+.DS_Store
+extracted_frames/
+*.mp4
