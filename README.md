@@ -2,7 +2,7 @@
 
 An intelligent, containerized AI agent that eliminates the operational bottlenecks of manual social media copy creation. Four Voices ingests raw video content and automatically generates four distinct narrative personas — each delivered in a structured, schema-compliant JSON format ready for production integration.
 
-## 🚀 The Multi-Model Pipeline
+## The Multi-Model Pipeline
 Data flows sequentially through specialized AI architectures to guarantee high-quality, contextual, and stylistically precise outputs:
 *   **01 · Ingestion:** Headless video frame extraction handled natively via OpenCV.
 *   **02 · Observation:** Kimi K2.6 runs multi-threaded, parallel frame analysis to concurrently extract visual semantics.
@@ -11,7 +11,7 @@ Data flows sequentially through specialized AI architectures to guarantee high-q
 
 ---
 
-## 🎭 The Four Voices
+## The Four Voices
 The agent evaluates the visual context and outputs the text across four highly targeted content perspectives:
 1.  **Formal:** Clear, objective, and corporate-ready descriptions.
 2.  **Sarcastic:** Witty, ironic, and high-engagement social copy.
@@ -20,7 +20,7 @@ The agent evaluates the visual context and outputs the text across four highly t
 
 ---
 
-## 🛠️ Project Structure
+## Project Structure
 *   `main.py` — The core automated headless agent execution pipeline.
 *   `app.py` — The interactive Streamlit user validation dashboard interface.
 *   `Dockerfile` — Ultra-lightweight multi-stage isolated deployment configuration (`python:3.11-slim-bookworm`).
@@ -28,7 +28,7 @@ The agent evaluates the visual context and outputs the text across four highly t
 
 ---
 
-## 📦 Deployment & Execution (Track 2 Headless)
+## Deployment & Execution (Track 2 Headless)
 
 ### 1. Interactive Web Interface
 To run the evaluation dashboard locally:
