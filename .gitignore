@@ -3,3 +3,4 @@ __pycache__/
 *.mp4
 input/
 output/
+frontend_frames*
