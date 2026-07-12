@@ -169,7 +169,7 @@ LABELS = {
     "formal": "FORMAL",
     "sarcastic": "SARCASTIC",
     "humorous_tech": "TECH",
-    "humorous_non_tech": "CASUAL",
+    "humorous_non_tech": "HUMOROUS NON TECH",
 }
 FONT_STACKS = {
     "formal": "'IBM Plex Sans', sans-serif",
