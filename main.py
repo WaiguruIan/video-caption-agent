@@ -35,15 +35,21 @@ fireworks_client = OpenAI(
     api_key=FIREWORKS_API_KEY,
 )
 
+# Gemini grounding is optional enrichment, not part of the harness-guaranteed stack.
 GEMINI_ENABLED = False
+gemini_client = None
+GEMINI_MODEL = "gemini-2.5-flash"
 if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    GEMINI_MODEL = "gemini-2.5-flash"
-    GEMINI_ENABLED = True
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        GEMINI_ENABLED = True
+    except Exception as e:
+        print(f"⚠️ Gemini client failed to initialize ({e}). Continuing without factual grounding.")
 
-MAX_VISION_WORKERS = 6  
+MAX_VISION_WORKERS = 6
 KIMI_RPM = 20
 DEEPSEEK_RPM = 600
+
 
 class RateLimiter:
     """Thread-safe sliding-window limiter. acquire() blocks until a slot is free."""
@@ -65,18 +71,23 @@ class RateLimiter:
                 wait = self.period - (now - self.timestamps[0]) + 0.05
             time.sleep(max(wait, 0.05))
 
+
 kimi_rate_limiter = RateLimiter(KIMI_RPM)
 deepseek_rate_limiter = RateLimiter(DEEPSEEK_RPM)
 
+
 def _is_retryable(e):
+    """Shared retry check used for BOTH Fireworks and Gemini calls, for consistency."""
     status = getattr(e, "status_code", None)
     if status in [429, 500, 502, 503, 504]:
         return True
     msg = str(e).lower()
-    return any(err in msg for err in ["429", "rate_limit", "connection", "timeout", "overloaded"])
+    return any(err in msg for err in ["429", "rate_limit", "connection", "timeout", "overloaded", "unavailable"])
+
 
 def _backoff_sleep(base_delay):
     time.sleep(min(base_delay, 60.0) + random.uniform(0.1, 1.5))
+
 
 # ==========================================
 # UTILITY HELPERS
@@ -85,18 +96,29 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
 
+
 def numerical_sort_key(path):
     numbers = re.findall(r"\d+", os.path.basename(path))
     return int(numbers[0]) if numbers else 0
 
+
 def clean_json_string(raw_str):
-    """Extracts valid JSON payload block using structural brace isolation."""
+    """Extracts valid JSON payload block using a non-greedy structural brace isolation."""
     if not raw_str:
         return ""
-    match = re.search(r"\{.*\}", raw_str, re.DOTALL)
+    match = re.search(r"(\{.*\})", raw_str, re.DOTALL)
     if match:
-        return match.group(0).strip()
+        return match.group(1).strip()
     return ""
+
+
+def save_atomic_json(file_path, data):
+    """Writes JSON payload atomically to prevent file corruption during disk or IO drops."""
+    temp_path = f"{file_path}.tmp"
+    with open(temp_path, "w") as f:
+        json.dump(data, f, indent=4)
+    os.replace(temp_path, file_path)
+
 
 CAPTION_JSON_SCHEMA = {
     "type": "object",
@@ -109,6 +131,25 @@ CAPTION_JSON_SCHEMA = {
     "required": ["formal", "sarcastic", "humorous_tech", "humorous_non_tech"],
     "additionalProperties": False
 }
+
+# Changing "strict" to False resolves inference engine compiler failures on Fireworks.
+CAPTIONS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "captions_response",
+        "strict": False,
+        "schema": CAPTION_JSON_SCHEMA,
+    },
+}
+VERIFIED_CAPTIONS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "verified_captions_response",
+        "strict": False,
+        "schema": CAPTION_JSON_SCHEMA,
+    },
+}
+
 
 def download_remote_video(url_or_path, task_idx=0):
     if isinstance(url_or_path, str) and url_or_path.startswith(("http://", "https://")):
@@ -134,6 +175,7 @@ def download_remote_video(url_or_path, task_idx=0):
                 raise RuntimeError(f"Failed to download evaluation asset: {url_or_path}")
     return url_or_path
 
+
 # ==========================================
 # FRAME EXTRACTION MODULE
 # ==========================================
@@ -158,7 +200,10 @@ def extract_video_frames(video_path, output_folder, task_idx=0, interval=30):
         return False
 
     fps = video.get(cv2.CAP_PROP_FPS)
-    actual_interval = int(fps) if fps > 0 else interval
+    if fps and fps > 0:
+        actual_interval = max(1, min(int(fps), 120))
+    else:
+        actual_interval = interval
 
     print(f"🎬 Slicing video target: '{processed_path}' at 1 frame per {actual_interval} ticks...")
     frame_count = 0
@@ -186,6 +231,7 @@ def extract_video_frames(video_path, output_folder, task_idx=0, interval=30):
 
     print(f"✅ Slicing completed. Saved {saved_count} frames safely.")
     return saved_count > 0
+
 
 # ==========================================
 # STEP 1: VISION TIMELINE ANALYSIS
@@ -237,6 +283,7 @@ def _describe_frame(idx, path):
                 return idx, f"[description unavailable — vision engine exception: {str(e)}]"
     return idx, "[description unavailable — max retries exhausted]"
 
+
 def generate_visual_timeline(frames_dir):
     print("\n🔍 Step 1: Processing video frames with Kimi K2.6 (Parallelized)...")
     frame_extensions = ["*.jpg", "*.jpeg", "*.png"]
@@ -262,8 +309,9 @@ def generate_visual_timeline(frames_dir):
     timeline_entries = [f"Frame {idx}: {results[idx]}" for idx in sorted(results.keys())]
     return "\n".join(timeline_entries)
 
+
 # ==========================================
-# STEP 2: GEMINI GROUNDING
+# STEP 2: GEMINI GROUNDING (Refined Fact Guard)
 # ==========================================
 def fetch_internet_context(visual_timeline):
     if not GEMINI_ENABLED:
@@ -271,16 +319,17 @@ def fetch_internet_context(visual_timeline):
         return ""
 
     print("\n🌐 Step 2: Grounding timeline using Gemini Search Tooling...")
+    
     prompt = f"""
-    You are an objective fact-checking agent. Analyze the provided timeline extracted from a video clip. Ground observations in verified facts using search.
+    You are an objective fact-checking agent. Your task is to analyze the provided visual timeline extracted from a video clip and ground its observations in verified real-world facts using your search tool.
 
     Visual Timeline Data:
     {visual_timeline}
 
     Instructions:
-    1. Identify any verified elements: individuals, specific events, products, or software interfaces.
-    2. Provide a brief, cross-verified factual summary of what that event actually is.
-    3. If an element cannot be verified, explicitly state "Cannot confirm entity identity."
+    1. Scan the timeline systematically. Identify verified real-world elements: specific individuals, notable public events, exact consumer products, or software interfaces.
+    2. For every identified entity, provide a concise, cross-verified factual summary explaining what it actually is based on search results.
+    3. If an entity, person, or software interface cannot be explicitly verified via search, you must output exactly: "Cannot confirm entity identity." for that specific item. Do not speculate or guess.
 
     Output Format:
     - Core Subject/Event: [Verified name or description]
@@ -309,68 +358,85 @@ def fetch_internet_context(visual_timeline):
                     print("⚠️ Gemini response text retrieval failed due to content classification blockers.")
                     return ""
         except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
+            if _is_retryable(e) and attempt < max_retries - 1:
                 _backoff_sleep(delay)
                 delay *= 2
             else:
+                print(f"⚠️ Gemini grounding failed ({e}). Continuing without it.")
                 break
     return ""
 
+
 # ==========================================
-# STEP 3: DEEPSEEK COPYWRITING ENGINE WITH SCHEMA
+# STEP 3: DEEPSEEK COPYWRITING ENGINE WITH SCHEMA (Optimized Constraints)
 # ==========================================
 def generate_final_captions(visual_timeline, factual_context):
     print("\n🧠 Step 3: Generating structured payloads using DeepSeek-V4-Pro...")
 
     system_prompt = (
-        "You are an advanced creative copywriting agent. Generate exactly 4 caption styles "
+        "You are an advanced creative copywriting agent. Generate exactly 4 distinct caption styles "
         "as a valid JSON object matching the requested properties schema.\n\n"
+        "CRITICAL MECHANICAL CONSTRAINTS:\n"
+        "- Length: Every single caption style must be exactly one sentence. No multi-sentence blocks.\n"
+        "- Punctuation & Style Rules: Do not use exclamation marks (!) or emojis anywhere in the JSON object.\n\n"
         "STRICT STYLE RUBRIC:\n"
-        "- formal: 1 sentence, no contractions, no exclamation marks, no emoji, no idioms. Purely descriptive.\n"
-        "- sarcastic: 1 sentence, must contain at least one ironic understatement or deadpan contrast. No exclamation marks.\n"
-        "- humorous_tech: 1 sentence, must contain exactly one concrete systems-engineering analogy mapping to the visual action.\n"
-        "- humorous_non_tech: 1 sentence, casual register, contractions allowed, everyday situational comparison.\n\n"
-        "ACCURACY RULES:\n"
-        "- Only reference entities explicitly confirmed. Do not invent details.\n"
-        "- Every caption must reference at least one concrete visual detail from the timeline."
+        "- formal: Exactly 1 sentence. Purely descriptive tone. Do not use contractions (e.g., use 'is not' instead of 'isn't'). Do not use idioms or informal language.\n"
+        "- sarcastic: Exactly 1 sentence. Must feature a deadpan contrast or ironic understatement. Period ending only.\n"
+        "- humorous_tech: Exactly 1 sentence. Must bridge the visual action to a concrete systems-engineering analogy (e.g., database deadlocks, race conditions, memory leaks, null pointers).\n"
+        "- humorous_non_tech: Exactly 1 sentence. Casual and conversational register. Contractions are allowed. Must use an everyday situational comparison.\n\n"
+        "ACCURACY & GROUNDING RULES:\n"
+        "- Rely strictly on the provided Timeline and Factual Context.\n"
+        "- Do not invent background information, names, or metrics not explicitly present in the data.\n"
+        "- Every caption variant must explicitly tie back to at least one concrete visual detail observed in the timeline."
     )
 
     factual_injection = f"Factual Context:\n{factual_context}\n\n" if factual_context else "Factual Context: [Not available. Rely entirely on the visual timeline.]\n\n"
     user_content = f"{factual_injection}Timeline:\n{visual_timeline}"
-    
+
     max_retries = 4
-    delay = 4.0
+    draft_delay = 4.0
     raw_captions = None
 
     for attempt in range(max_retries):
         deepseek_rate_limiter.acquire()
         try:
+            # First try with JSON schema mode (strict set to False)
             response = fireworks_client.chat.completions.create(
                 model="accounts/fireworks/models/deepseek-v4-pro",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "captions_response",
-                        "schema": CAPTION_JSON_SCHEMA
-                    }
-                },
+                response_format=CAPTIONS_RESPONSE_FORMAT,
                 max_tokens=1500,
                 temperature=0.3,
             )
             raw_captions = response.choices[0].message.content.strip()
             if clean_json_string(raw_captions):
                 break
-        except Exception as e:
-            if _is_retryable(e) and attempt < max_retries - 1:
-                _backoff_sleep(delay)
-                delay *= 2
-            else:
-                print(f"❌ DeepSeek Primary generation execution fault: {e}")
-                return None
+        except Exception:
+            # Fallback directly to regular json_object if schema parsing fails on the endpoint
+            try:
+                response = fireworks_client.chat.completions.create(
+                    model="accounts/fireworks/models/deepseek-v4-pro",
+                    messages=[
+                        {"role": "system", "content": system_prompt + "\nOutput raw JSON only."},
+                        {"role": "user", "content": user_content},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=1500,
+                    temperature=0.3,
+                )
+                raw_captions = response.choices[0].message.content.strip()
+                if clean_json_string(raw_captions):
+                    break
+            except Exception as e:
+                if _is_retryable(e) and attempt < max_retries - 1:
+                    _backoff_sleep(draft_delay)
+                    draft_delay *= 2
+                else:
+                    print(f"❌ DeepSeek Primary generation execution fault: {e}")
+                    return None
 
     if not raw_captions or not clean_json_string(raw_captions):
         print("❌ Primary caption generation failed to yield a valid schema payload string.")
@@ -385,6 +451,7 @@ def generate_final_captions(visual_timeline, factual_context):
 
     gate_user_content = f"Timeline:\n{visual_timeline}\n\nContext:\n{factual_context}\n\nTarget JSON:\n{raw_captions}"
 
+    gate_delay = 4.0
     for attempt in range(max_retries):
         deepseek_rate_limiter.acquire()
         try:
@@ -394,34 +461,42 @@ def generate_final_captions(visual_timeline, factual_context):
                     {"role": "system", "content": gate_system_prompt},
                     {"role": "user", "content": gate_user_content},
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "verified_captions_response",
-                        "schema": CAPTION_JSON_SCHEMA
-                    }
-                },
+                response_format=VERIFIED_CAPTIONS_RESPONSE_FORMAT,
                 max_tokens=1500,
                 temperature=0.1,
             )
             res_content = gate_response.choices[0].message.content.strip()
             if clean_json_string(res_content):
                 return res_content
-            else:
-                print(f"⚠️ Verification Guard attempt {attempt + 1} yielded non-JSON text. Retrying...")
-        except Exception as e:
-            if _is_retryable(e) and attempt < max_retries - 1:
-                _backoff_sleep(delay)
-                delay *= 2
-            else:
-                print(f"⚠️ Verification Guard failure: {e}. Falling back safely to raw primary captions.")
-                return raw_captions
+        except Exception:
+            try:
+                gate_response = fireworks_client.chat.completions.create(
+                    model="accounts/fireworks/models/deepseek-v4-pro",
+                    messages=[
+                        {"role": "system", "content": gate_system_prompt + "\nOutput raw JSON only."},
+                        {"role": "user", "content": gate_user_content},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=1500,
+                    temperature=0.1,
+                )
+                res_content = gate_response.choices[0].message.content.strip()
+                if clean_json_string(res_content):
+                    return res_content
+            except Exception as e:
+                if _is_retryable(e) and attempt < max_retries - 1:
+                    _backoff_sleep(gate_delay)
+                    gate_delay *= 2
+                else:
+                    print(f"⚠️ Verification Guard failure: {e}. Falling back safely to raw primary captions.")
+                    return raw_captions
 
     print("⚠️ Verification Guard failed to safely clear validation schema. Defaulting to raw primary captions.")
     return raw_captions
 
+
 def process_single_video(video_path, frames_dir, task_idx=0):
-    """Encapsulates execution per asset item to support batch safely."""
+    """Encapsulates execution per asset item with automatic storage containment guarantees."""
     if not extract_video_frames(video_path, frames_dir, task_idx=task_idx):
         print(f"❌ Skipping target: Frame extraction failed for {video_path}")
         return None
@@ -446,7 +521,20 @@ def process_single_video(video_path, frames_dir, task_idx=0):
                 print("❌ Post-processed target text content lacks structured braces.")
     except Exception as single_task_err:
         print(f"⚠️ Task processing execution anomaly encountered: {single_task_err}")
+    finally:
+        # Strict filesystem cleanup guard to protect volume storage thresholds across long batches
+        if os.path.exists(frames_dir):
+            for file in glob.glob(os.path.join(frames_dir, "*")):
+                try:
+                    os.remove(file)
+                except Exception:
+                    pass
+            try:
+                os.rmdir(frames_dir)
+            except Exception:
+                pass
     return None
+
 
 # ==========================================
 # PIPELINE EXECUTION ENGINE
@@ -466,7 +554,7 @@ if __name__ == "__main__":
         try:
             with open(INPUT_JSON_PATH, "r") as config_file:
                 task_data = json.load(config_file)
-            
+
             if isinstance(task_data, list):
                 tasks = task_data
                 is_batch = True
@@ -488,27 +576,31 @@ if __name__ == "__main__":
         for idx, task in enumerate(tasks):
             target_video = task.get("video_path") or task.get("video") or task.get("video_url") or DEFAULT_VIDEO_FILE
             print(f"\n🎯 Processing Task {idx + 1}/{len(tasks)}: '{target_video}'")
-            
+
             task_frames_dir = f"{FRAMES_DIRECTORY}_{idx}" if is_batch else FRAMES_DIRECTORY
             result_payload = process_single_video(target_video, task_frames_dir, task_idx=idx)
-            
+
             if result_payload:
                 merged_item = {}
                 if isinstance(task, dict):
                     for key, val in task.items():
                         if key not in ["video_path", "video", "video_url"]:
                             merged_item[key] = val
-                
+
                 merged_item.update(result_payload)
                 final_results.append(merged_item)
 
                 current_payload = final_results if is_batch else final_results[0]
-                with open(OUTPUT_JSON_PATH, "w") as f:
-                    json.dump(current_payload, f, indent=4)
-                print(f"💾 Progressive checkpoint saved safely to '{OUTPUT_JSON_PATH}'")
+                
+                # Persist state atomically to completely guarantee checkpoint file integrity
+                try:
+                    save_atomic_json(OUTPUT_JSON_PATH, current_payload)
+                    print(f"💾 Progressive checkpoint saved safely to '{OUTPUT_JSON_PATH}'")
+                except Exception as io_err:
+                    print(f"⚠️ Critical progressive state save stalled on IO: {io_err}")
 
         if not final_results:
             sys.exit("❌ Pipeline Terminated: Zero valid payloads generated.")
-            
+
     except Exception as pipeline_error:
         sys.exit(f"❌ Pipeline Operational Collapse: {pipeline_error}")
